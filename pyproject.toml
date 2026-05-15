@@ -21,19 +21,32 @@ dependencies = [
     "torchvision==0.22.0",
     "torchaudio==2.7.0",
 
-    "diffusers",
-    "transformers",
-    "tokenizers",
-    "tqdm",
-    "imageio",
+    "accelerate==1.1.1",
+    "diffusers==0.36.0",
     "easydict",
+    "ftfy",
+    "matplotlib",
+    "msgpack",
+    "numpy<2",
+    "opencv-python",
+    # "tokenizers",
+    # "tqdm",
+    "transformers==4.55.2",
+    "websockets",
+
     # "flash_attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.5/flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl",
     "flash_attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl",
-    "numpy<2",
 
     "lerobot==0.3.3",
     "scipy",
     "wandb",
+
+    "zmq",
+    "pyrealsense2",
+    "pymodbus",
+
+    "h5py",
+    "imageio[ffmpeg]",
 ]
 
 [[tool.uv.index]]
