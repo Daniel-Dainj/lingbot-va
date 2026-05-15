@@ -10,3 +10,7 @@ wheels/
 .venv
 
 uv.lock
+
+checkpoints
+data
+runs
