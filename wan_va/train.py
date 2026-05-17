@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+from copy import deepcopy
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,83 @@ from utils import (
 
 from dataset import MultiLatentLeRobotDataset
 import gc
+
+
+def _ensure_local_hf_cache():
+    hf_home = Path(os.getenv("HF_HOME", Path.cwd() / ".hf")).resolve()
+    datasets_cache = Path(os.getenv("HF_DATASETS_CACHE", hf_home / "datasets")).resolve()
+    hub_cache = Path(os.getenv("HUGGINGFACE_HUB_CACHE", hf_home / "hub")).resolve()
+
+    hf_home.mkdir(parents=True, exist_ok=True)
+    datasets_cache.mkdir(parents=True, exist_ok=True)
+    hub_cache.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(datasets_cache))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hub_cache))
+
+
+def _load_norm_stat(norm_stat_path):
+    with open(norm_stat_path, "r") as f:
+        norm_stat = json.load(f)
+
+    if "q01" not in norm_stat or "q99" not in norm_stat:
+        raise ValueError(f"Invalid norm stat file: {norm_stat_path}")
+
+    return norm_stat
+
+
+def _override_config_from_args(config, args):
+    if args.save_root is not None:
+        config.save_root = args.save_root
+
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+        config.empty_emb_path = os.path.join(config.dataset_path, "empty_emb.pt")
+
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
+
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
+
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+
+    if args.gradient_accumulation_steps is not None:
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+
+    if args.load_worker is not None:
+        config.load_worker = args.load_worker
+
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+
+    if args.warmup_steps is not None:
+        config.warmup_steps = args.warmup_steps
+
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
+
+    if args.enable_wandb:
+        config.enable_wandb = True
+    if args.disable_wandb:
+        config.enable_wandb = False
+
+    norm_stat_path = args.norm_stat_path
+    if norm_stat_path is None and hasattr(config, "dataset_path"):
+        candidate_path = Path(config.dataset_path) / "meta" / "lingbot_action_stats.json"
+        if candidate_path.exists():
+            norm_stat_path = str(candidate_path)
+
+    if norm_stat_path is not None:
+        config.norm_stat = _load_norm_stat(norm_stat_path)
+        config.norm_stat_path = norm_stat_path
+
+    return config
 
 
 class Trainer:
@@ -145,8 +223,8 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        if hasattr(config, 'resume_from') and config.resume_from:
+            self._load_training_state(config.resume_from)
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -336,10 +414,11 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
+            optim_state = get_optimizer_state_dict(
+                self.transformer,
+                self.optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -364,14 +443,17 @@ class Trainer:
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                training_state_path = checkpoint_dir / "training_state.pt"
+                logger.info(f"Saving training state to {training_state_path}")
+                torch.save(
+                    {
+                        "step": self.step,
+                        "optimizer_state_dict": optim_state,
+                        "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+                        "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                    },
+                    training_state_path,
+                )
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
@@ -410,6 +492,8 @@ class Trainer:
             optim_state_dict=training_state['optimizer_state_dict'],
             options=StateDictOptions(full_state_dict=True, strict=False)
         )
+        if "lr_scheduler_state_dict" in training_state:
+            self.lr_scheduler.load_state_dict(training_state["lr_scheduler_state_dict"])
         self.step = training_state.get('step', 0)
 
         if self.config.rank == 0:
@@ -505,7 +589,9 @@ class Trainer:
 
 def run(args):
     """Main entry point."""
-    config = VA_CONFIGS[args.config_name]
+    config = deepcopy(VA_CONFIGS[args.config_name])
+    config = _override_config_from_args(config, args)
+    _ensure_local_hf_cache()
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -517,12 +603,17 @@ def run(args):
     config.local_rank = local_rank
     config.world_size = world_size
 
-    if args.save_root is not None:
-        config.save_root = args.save_root
-
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        if hasattr(config, "dataset_path"):
+            logger.info(f"Dataset path: {config.dataset_path}")
+        if hasattr(config, "wan22_pretrained_model_name_or_path"):
+            logger.info(f"Model path: {config.wan22_pretrained_model_name_or_path}")
+        if hasattr(config, "resume_from") and config.resume_from:
+            logger.info(f"Resume from: {config.resume_from}")
+        if hasattr(config, "norm_stat_path"):
+            logger.info(f"Norm stat path: {config.norm_stat_path}")
 
     trainer = Trainer(config)
     trainer.train()
@@ -542,6 +633,82 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Path to the converted LeRobot dataset root",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to the LingBot-VA base checkpoint root",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Checkpoint directory created by a previous training run",
+    )
+    parser.add_argument(
+        "--norm-stat-path",
+        type=str,
+        default=None,
+        help="JSON file containing q01/q99 normalization statistics",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Per-rank batch size",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Number of micro-batches to accumulate before each optimizer step",
+    )
+    parser.add_argument(
+        "--load-worker",
+        type=int,
+        default=None,
+        help="Number of dataloader workers",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="AdamW learning rate",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="LR warmup steps",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Total optimizer steps to train",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=None,
+        help="Checkpoint save interval in optimizer steps",
+    )
+    parser.add_argument(
+        "--enable-wandb",
+        action="store_true",
+        help="Enable WandB logging",
+    )
+    parser.add_argument(
+        "--disable-wandb",
+        action="store_true",
+        help="Disable WandB logging",
     )
 
     args = parser.parse_args()
