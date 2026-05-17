@@ -19,6 +19,7 @@ va_rokae_train_cfg.save_interval = 500
 va_rokae_train_cfg.gc_interval = 50
 va_rokae_train_cfg.cfg_prob = 0.1
 va_rokae_train_cfg.resume_from = None
+va_rokae_train_cfg.enable_cpu_offload = os.getenv("ROKAE_ENABLE_CPU_OFFLOAD", "1") == "1"
 
 # Training parameters
 va_rokae_train_cfg.learning_rate = 1e-5

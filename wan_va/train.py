@@ -4,6 +4,7 @@ from copy import deepcopy
 import os
 import sys
 from pathlib import Path
+from functools import partial
 import wandb
 
 import torch
@@ -170,7 +171,11 @@ class Trainer:
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = shard_model
+        shard_fn = partial(
+            shard_model,
+            param_dtype=self.dtype,
+            enable_cpu_offload=getattr(config, "enable_cpu_offload", False),
+        )
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -188,7 +193,7 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             eps=1e-8,
             weight_decay=config.weight_decay,
-            fused=True,
+            fused=not getattr(config, "enable_cpu_offload", False),
             foreach=False,
         )
 
