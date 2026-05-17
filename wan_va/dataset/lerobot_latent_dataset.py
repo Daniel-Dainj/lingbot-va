@@ -7,7 +7,7 @@ from pathlib import Path
 from collections.abc import Callable
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
+from multiprocessing import get_context
 from functools import partial
 import torch
 from einops import rearrange
@@ -28,6 +28,18 @@ def recursive_find_file(directory, filename='info.json'):
         print(f"Error: {e}")
     return result
 
+
+def recursive_detach_tensor(data):
+    if torch.is_tensor(data):
+        return data.detach()
+    if isinstance(data, dict):
+        return {k: recursive_detach_tensor(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [recursive_detach_tensor(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(recursive_detach_tensor(v) for v in data)
+    return data
+
 def construct_lerobot(
     repo_id,
     config,
@@ -40,17 +52,33 @@ def construct_lerobot(
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
-    datasets_out_lst = []
     construct_func = partial(
         construct_lerobot,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
-                
-    return datasets_out_lst
+    repo_list = sorted({v.split('/meta/info.json')[0] for v in repo_list})
+
+    if not repo_list:
+        raise FileNotFoundError(
+            f"No LeRobot dataset roots were found under: {config.dataset_path}"
+        )
+
+    # In training we initialize CUDA/NCCL before dataset creation.
+    # Forking worker processes after CUDA init can look like a hang,
+    # and returning full dataset objects through multiprocessing is slow anyway.
+    use_multiprocessing = (
+        len(repo_list) > 1
+        and num_init_worker > 1
+        and not torch.cuda.is_initialized()
+    )
+
+    if not use_multiprocessing:
+        return [construct_func(repo_id) for repo_id in repo_list]
+
+    num_init_worker = min(num_init_worker, len(repo_list))
+    with get_context("spawn").Pool(num_init_worker) as pool:
+        return pool.map(construct_func, repo_list)
 
 def get_relative_pose(pose):
     if torch.is_tensor(pose):
@@ -142,7 +170,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
-        self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
+        self.empty_emb = recursive_detach_tensor(
+            torch.load(config.empty_emb_path, weights_only=False)
+        )
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
@@ -216,7 +246,9 @@ class LatentLeRobotDataset(LeRobotDataset):
                 cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
             )
             assert os.path.exists(latent_file)
-            latent_data = torch.load(latent_file, weights_only=False)
+            latent_data = recursive_detach_tensor(
+                torch.load(latent_file, weights_only=False)
+            )
             out[key] = latent_data
         
         return self._flatten_latent_dict(out)

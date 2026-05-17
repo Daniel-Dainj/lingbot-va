@@ -3,6 +3,7 @@
 """Extract Wan2.2 VAE latents and text embeddings for the converted ROKAE dataset."""
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
 from transformers import T5TokenizerFast, UMT5EncoderModel
 
-from wan_va.modules.utils import WanVAEStreamingWrapper, load_vae
+from wan_va.modules.utils import load_vae
 
 
 OBS_CAM_TO_H5_KEY = {
@@ -37,6 +38,12 @@ def parse_args():
         help="Camera feature name stored in the LeRobot dataset",
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Torch device used for encoding")
+    parser.add_argument(
+        "--text-device",
+        type=str,
+        default=None,
+        help="Device used for text embedding extraction. Defaults to cpu when VAE runs on CUDA.",
+    )
     parser.add_argument("--max-seq-len", type=int, default=512, help="Text embedding sequence length")
     parser.add_argument("--max-episodes", type=int, default=None, help="Optional cap used for smoke tests")
     parser.add_argument("--skip-existing", action="store_true", help="Skip latent files that already exist")
@@ -72,22 +79,23 @@ def get_prompt_embedding(
     dtype: torch.dtype,
     max_sequence_length: int,
 ) -> torch.Tensor:
-    text_inputs = tokenizer(
-        [prompt_clean(prompt)],
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        add_special_tokens=True,
-        return_attention_mask=True,
-        return_tensors="pt",
-    )
-    input_ids = text_inputs.input_ids.to(device)
-    attention_mask = text_inputs.attention_mask.to(device)
-    seq_len = int(attention_mask.gt(0).sum(dim=1)[0].item())
-    hidden_state = text_encoder(input_ids, attention_mask).last_hidden_state[0].to(dtype=dtype)
-    out = hidden_state.new_zeros((max_sequence_length, hidden_state.shape[-1]))
-    out[:seq_len] = hidden_state[:seq_len]
-    return out.cpu()
+    with torch.inference_mode():
+        text_inputs = tokenizer(
+            [prompt_clean(prompt)],
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids.to(device)
+        attention_mask = text_inputs.attention_mask.to(device)
+        seq_len = int(attention_mask.gt(0).sum(dim=1)[0].item())
+        hidden_state = text_encoder(input_ids, attention_mask).last_hidden_state[0].to(dtype=dtype)
+        out = hidden_state.new_zeros((max_sequence_length, hidden_state.shape[-1]))
+        out[:seq_len] = hidden_state[:seq_len]
+    return out.detach().cpu()
 
 
 def normalize_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> torch.Tensor:
@@ -105,7 +113,57 @@ def resize_video(video_frames: np.ndarray, height: int, width: int) -> torch.Ten
 def save_empty_embedding(empty_emb: torch.Tensor, dataset_root: Path):
     empty_emb_path = dataset_root / "empty_emb.pt"
     if not empty_emb_path.exists():
-        torch.save(empty_emb.to(torch.bfloat16), empty_emb_path)
+        torch.save(empty_emb.detach().to(torch.bfloat16), empty_emb_path)
+
+
+def clear_cuda_memory(device: torch.device):
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def encode_camera_latent(
+    vae,
+    video_frames: np.ndarray,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+) -> torch.Tensor:
+    video_batch = resize_video(video_frames, height, width).to(device=device, dtype=dtype)
+    video_batch = video_batch / 255.0 * 2.0 - 1.0
+
+    with torch.inference_mode():
+        posterior = vae.encode(video_batch).latent_dist
+        mu_norm = normalize_latents(posterior.mean, latents_mean, 1.0 / latents_std)
+
+    latent = mu_norm[0].detach().cpu().to(torch.bfloat16)
+    del video_batch, posterior, mu_norm
+    clear_cuda_memory(device)
+    return latent
+
+
+def build_prompt_embedding_cache(
+    tokenizer: T5TokenizerFast,
+    text_encoder: UMT5EncoderModel,
+    prompts: list[str],
+    text_device: torch.device,
+    output_dtype: torch.dtype,
+    max_sequence_length: int,
+) -> dict[str, torch.Tensor]:
+    cache = {}
+    for prompt in prompts:
+        cache[prompt] = get_prompt_embedding(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            prompt=prompt,
+            device=text_device,
+            dtype=output_dtype,
+            max_sequence_length=max_sequence_length,
+        ).detach().to(torch.bfloat16)
+    return cache
 
 
 def main():
@@ -123,32 +181,47 @@ def main():
 
     device = torch.device(args.device)
     dtype = torch.bfloat16
-
-    tokenizer = T5TokenizerFast.from_pretrained(model_root / "tokenizer")
-    text_encoder = UMT5EncoderModel.from_pretrained(model_root / "text_encoder", torch_dtype=dtype).to(device)
-    text_encoder.eval()
-
-    vae = load_vae(model_root / "vae", torch_dtype=dtype, torch_device=device)
-    vae.eval()
-    streaming_vae = WanVAEStreamingWrapper(vae)
-
-    latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=dtype)
-    latents_std = torch.tensor(vae.config.latents_std, device=device, dtype=dtype)
-
-    empty_emb = get_prompt_embedding(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        prompt="",
-        device=device,
-        dtype=dtype,
-        max_sequence_length=args.max_seq_len,
-    )
-    save_empty_embedding(empty_emb, dataset_root)
+    if args.text_device is not None:
+        text_device = torch.device(args.text_device)
+    else:
+        text_device = torch.device("cpu") if device.type == "cuda" else device
+    text_dtype = dtype if text_device.type == "cuda" else torch.float32
 
     episode_records = load_episode_records(dataset_root)
     source_manifest = load_source_manifest(dataset_root)
     if args.max_episodes is not None:
         episode_records = episode_records[: args.max_episodes]
+
+    unique_prompts = {""}
+    for episode_record in episode_records:
+        for action_cfg in episode_record["action_config"]:
+            unique_prompts.add(action_cfg["action_text"])
+
+    tokenizer = T5TokenizerFast.from_pretrained(model_root / "tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(model_root / "text_encoder", torch_dtype=text_dtype).to(
+        text_device
+    )
+    text_encoder.eval()
+
+    prompt_embedding_cache = build_prompt_embedding_cache(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        prompts=sorted(unique_prompts),
+        text_device=text_device,
+        output_dtype=dtype,
+        max_sequence_length=args.max_seq_len,
+    )
+    empty_emb = prompt_embedding_cache[""]
+    save_empty_embedding(empty_emb, dataset_root)
+
+    del text_encoder
+    clear_cuda_memory(text_device)
+
+    vae = load_vae(model_root / "vae", torch_dtype=dtype, torch_device=device)
+    vae.eval()
+
+    latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=dtype)
+    latents_std = torch.tensor(vae.config.latents_std, device=device, dtype=dtype)
 
     for episode_record in episode_records:
         episode_index = episode_record["episode_index"]
@@ -167,19 +240,7 @@ def main():
                 end_frame = int(action_cfg["end_frame"])
                 action_text = action_cfg["action_text"]
                 frame_ids = list(range(start_frame, end_frame))
-                text_emb = get_prompt_embedding(
-                    tokenizer=tokenizer,
-                    text_encoder=text_encoder,
-                    prompt=action_text,
-                    device=device,
-                    dtype=dtype,
-                    max_sequence_length=args.max_seq_len,
-                ).to(torch.bfloat16)
-
-                videos = []
-                for obs_cam_key in args.obs_cam_key:
-                    h5_key = OBS_CAM_TO_H5_KEY[obs_cam_key]
-                    videos.append(resize_video(h5_file[h5_key][frame_ids], args.height, args.width))
+                text_emb = prompt_embedding_cache[action_text]
 
                 all_exist = True
                 episode_chunk = episode_index // 1000
@@ -194,26 +255,30 @@ def main():
                 if args.skip_existing and all_exist:
                     continue
 
-                video_batch = torch.cat(videos, dim=0).to(device=device, dtype=dtype)
-                video_batch = video_batch / 255.0 * 2.0 - 1.0
+                for obs_cam_key, latent_path in output_paths:
+                    if args.skip_existing and latent_path.exists():
+                        continue
 
-                streaming_vae.clear_cache()
-                with torch.inference_mode():
-                    enc_out = streaming_vae.encode_chunk(video_batch)
-                    mu, _ = torch.chunk(enc_out, 2, dim=1)
-                    mu_norm = normalize_latents(mu, latents_mean, 1.0 / latents_std)
-
-                for cam_idx, (obs_cam_key, latent_path) in enumerate(output_paths):
-                    cam_latent = mu_norm[cam_idx : cam_idx + 1]
-                    _, channels, latent_num_frames, latent_height, latent_width = cam_latent.shape
+                    h5_key = OBS_CAM_TO_H5_KEY[obs_cam_key]
+                    cam_latent = encode_camera_latent(
+                        vae=vae,
+                        video_frames=h5_file[h5_key][frame_ids],
+                        height=args.height,
+                        width=args.width,
+                        device=device,
+                        dtype=dtype,
+                        latents_mean=latents_mean,
+                        latents_std=latents_std,
+                    )
+                    channels, latent_num_frames, latent_height, latent_width = cam_latent.shape
                     latent_payload = {
-                        "latent": rearrange(cam_latent[0].detach().cpu(), "c f h w -> (f h w) c").to(torch.bfloat16),
+                        "latent": rearrange(cam_latent, "c f h w -> (f h w) c"),
                         "latent_num_frames": int(latent_num_frames),
                         "latent_height": int(latent_height),
                         "latent_width": int(latent_width),
                         "video_num_frames": int(len(frame_ids)),
-                        "video_height": int(h5_file[OBS_CAM_TO_H5_KEY[obs_cam_key]].shape[1]),
-                        "video_width": int(h5_file[OBS_CAM_TO_H5_KEY[obs_cam_key]].shape[2]),
+                        "video_height": int(h5_file[h5_key].shape[1]),
+                        "video_width": int(h5_file[h5_key].shape[2]),
                         "text_emb": text_emb,
                         "text": action_text,
                         "frame_ids": frame_ids,
@@ -224,6 +289,8 @@ def main():
                         "channels": int(channels),
                     }
                     torch.save(latent_payload, latent_path)
+                    del cam_latent
+                    clear_cuda_memory(device)
 
     print(f"Saved empty embedding to {dataset_root / 'empty_emb.pt'}")
     print(f"Saved latent files under {dataset_root / 'latents'}")

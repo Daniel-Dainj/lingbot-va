@@ -16,11 +16,13 @@ HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 mkdir -p "${HF_DATASETS_CACHE}" "${HUGGINGFACE_HUB_CACHE}"
 export HF_HOME HF_DATASETS_CACHE HUGGINGFACE_HUB_CACHE
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 RAW_ROOT="${RAW_ROOT:-${ROOT_DIR}/data/rokae_demo/260514/raw_episodes}"
 DATASET_ROOT="${DATASET_ROOT:-${ROOT_DIR}/data/rokae_demo/260514/lerobot/pick_up_the_workpiece}"
 MODEL_ROOT="${MODEL_ROOT:-${ROOT_DIR}/checkpoints/lingbot-va/lingbot-va-base}"
 DEVICE="${DEVICE:-cuda:0}"
+TEXT_DEVICE="${TEXT_DEVICE:-cpu}"
 HEIGHT="${HEIGHT:-256}"
 WIDTH="${WIDTH:-320}"
 
@@ -35,6 +37,7 @@ fi
   --dataset-root "${DATASET_ROOT}" \
   --model-root "${MODEL_ROOT}" \
   --device "${DEVICE}" \
+  --text-device "${TEXT_DEVICE}" \
   --height "${HEIGHT}" \
   --width "${WIDTH}" \
   --skip-existing
